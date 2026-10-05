@@ -2,9 +2,11 @@ import logging
 from flask import current_app, jsonify
 import json
 import requests
-
-# from app.services.openai_service import generate_response
 import re
+import threading
+from collections import OrderedDict
+
+from app.services.gemini_service import generate_response
 
 
 def log_http_response(response):
@@ -25,9 +27,24 @@ def get_text_message_input(recipient, text):
     )
 
 
-def generate_response(response):
-    # Return text in uppercase
-    return response.upper()
+# Meta retries webhooks it considers failed, so the same message can be
+# delivered more than once. Remember the ids we have already answered.
+MAX_SEEN_MESSAGE_IDS = 1000
+_seen_message_ids = OrderedDict()
+_seen_lock = threading.Lock()
+
+
+def already_handled(message_id):
+    """True if this message id has been seen before (and record it if not)."""
+    if not message_id:
+        return False
+    with _seen_lock:
+        if message_id in _seen_message_ids:
+            return True
+        _seen_message_ids[message_id] = None
+        while len(_seen_message_ids) > MAX_SEEN_MESSAGE_IDS:
+            _seen_message_ids.popitem(last=False)
+        return False
 
 
 def send_message(data):
@@ -76,20 +93,32 @@ def process_text_for_whatsapp(text):
 
 
 def process_whatsapp_message(body):
-    wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
-    name = body["entry"][0]["changes"][0]["value"]["contacts"][0]["profile"]["name"]
+    value = body["entry"][0]["changes"][0]["value"]
+    wa_id = value["contacts"][0]["wa_id"]
+    name = value["contacts"][0]["profile"]["name"]
 
-    message = body["entry"][0]["changes"][0]["value"]["messages"][0]
+    message = value["messages"][0]
+    message_type = message.get("type")
+
+    if already_handled(message.get("id")):
+        logging.info(f"Skipping repeat delivery of message {message.get('id')}")
+        return
+
+    # Only text messages carry a body we can read. Images, audio, reactions and
+    # the like would raise a KeyError below and return a 500 to Meta, which
+    # retries and can eventually disable the webhook.
+    if message_type != "text":
+        logging.info(f"Ignoring unsupported message type '{message_type}' from {wa_id}")
+        return
+
     message_body = message["text"]["body"]
 
-    # TODO: implement custom function here
-    response = generate_response(message_body)
+    response = generate_response(message_body, wa_id, name)
+    # Gemini writes **bold**; WhatsApp expects *bold*.
+    response = process_text_for_whatsapp(response)
 
-    # OpenAI Integration
-    # response = generate_response(message_body, wa_id, name)
-    # response = process_text_for_whatsapp(response)
-
-    data = get_text_message_input(current_app.config["RECIPIENT_WAID"], response)
+    # Reply to whoever sent the message, not a hardcoded recipient
+    data = get_text_message_input(wa_id, response)
     send_message(data)
 
 

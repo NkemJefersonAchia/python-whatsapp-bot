@@ -1,5 +1,6 @@
 import logging
 import json
+import threading
 
 from flask import Blueprint, request, jsonify, current_app
 
@@ -10,6 +11,15 @@ from .utils.whatsapp_utils import (
 )
 
 webhook_blueprint = Blueprint("webhook", __name__)
+
+
+def _process_in_background(app, body):
+    """Answer a message outside the webhook request, with its own app context."""
+    with app.app_context():
+        try:
+            process_whatsapp_message(body)
+        except Exception:
+            logging.exception("Failed to process WhatsApp message")
 
 
 def handle_message():
@@ -41,20 +51,27 @@ def handle_message():
 
     try:
         if is_valid_whatsapp_message(body):
-            process_whatsapp_message(body)
+            # Answering means a model call plus a round trip to Meta, which takes
+            # longer than Meta waits before retrying the webhook. Acknowledge
+            # straight away and do the slow part in a worker thread.
+            threading.Thread(
+                target=_process_in_background,
+                args=(current_app._get_current_object(), body),
+                daemon=True,
+            ).start()
             return jsonify({"status": "ok"}), 200
         else:
-            # if the request is not a WhatsApp API event, return an error
-            return (
-                jsonify({"status": "error", "message": "Not a WhatsApp API event"}),
-                404,
-            )
+            # Acknowledge events we don't handle (message_echoes, template
+            # updates, ...). Meta retries non-2xx responses and disables the
+            # webhook after repeated failures, so don't return an error here.
+            logging.info("Received an unhandled WhatsApp event.")
+            return jsonify({"status": "ok"}), 200
     except json.JSONDecodeError:
         logging.error("Failed to decode JSON")
         return jsonify({"status": "error", "message": "Invalid JSON provided"}), 400
 
 
-# Required webhook verifictaion for WhatsApp
+# Required webhook verification for WhatsApp
 def verify():
     # Parse params from the webhook verification request
     mode = request.args.get("hub.mode")
@@ -72,7 +89,7 @@ def verify():
             logging.info("VERIFICATION_FAILED")
             return jsonify({"status": "error", "message": "Verification failed"}), 403
     else:
-        # Responds with '400 Bad Request' if verify tokens do not match
+        # Responds with '400 Bad Request' if parameters are missing
         logging.info("MISSING_PARAMETER")
         return jsonify({"status": "error", "message": "Missing parameters"}), 400
 
@@ -81,9 +98,8 @@ def verify():
 def webhook_get():
     return verify()
 
+
 @webhook_blueprint.route("/webhook", methods=["POST"])
 @signature_required
 def webhook_post():
     return handle_message()
-
-

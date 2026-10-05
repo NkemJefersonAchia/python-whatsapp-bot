@@ -1,5 +1,5 @@
 flask
 python-dotenv
-openai
+google-genai==1.47.0
 aiohttp
 requests
